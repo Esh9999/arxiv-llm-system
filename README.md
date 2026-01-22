@@ -1,10 +1,10 @@
 0) Что должно быть установлено
 
-Docker Desktop (обязательно)
+Docker Desktop(обязательно)
 
 Открой Docker Desktop → убедись, что он запущен.
 
-PowerShell (у тебя уже есть)
+PowerShell
 
 Проверка Docker:
 

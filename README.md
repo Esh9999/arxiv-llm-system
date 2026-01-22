@@ -1,119 +1,69 @@
-# arxiv-llm-system
+0) Что должно быть установлено
 
-Two-microservice system to fetch scientific papers from arXiv and analyze them with an LLM (structured JSON output).
+Docker Desktop (обязательно)
 
-## Architecture
+Открой Docker Desktop → убедись, что он запущен.
 
-- **fetcher-service** (FastAPI, port **8001**)
-  - Fetch by arXiv ID or search by query using arXiv API (Atom/XML)
-  - Optionally downloads PDF and extracts text (limited pages/size)
-  - Returns normalized article payload
+PowerShell (у тебя уже есть)
 
-- **analyzer-service** (FastAPI, port **8002**)
-  - Accepts article payload
-  - Calls an LLM to extract key info + categorize + summarize
-  - Returns strict JSON (validated by Pydantic)
-  - Supports cache + batch processing
+Проверка Docker:
 
-Flow: `Client -> fetcher (/fetch) -> analyzer (/analyze or /batch-analyze)`.
+docker version
+docker compose version
 
-## Requirements
+1) Перейти в папку проекта
+cd C:\Users\P2837\Downloads\arxiv-llm-system
 
-- Docker Desktop (Windows/macOS/Linux)
-- (Optional) Python 3.10+ if you want to run locally without Docker
 
-## Quick start (Docker)
+Проверка что файлы на месте:
 
-### 1) Create `.env`
+dir
 
-Copy example:
-```bash
-cp .env.example .env
-Then edit .env and choose one provider:
 
-Option A — OpenAI-compatible (OpenAI / OpenRouter / etc.)
-LLM_PROVIDER=openai
-LLM_API_KEY=YOUR_API_KEY_HERE
-LLM_BASE_URL=https://openrouter.ai/api/v1
-LLM_MODEL=nvidia/nemotron-nano-9b-v2:free
-LLM_JSON_MODE=1
-Option B — YandexGPT (Yandex Cloud)
+Ты должен видеть: docker-compose.yml, fetcher-service, analyzer-service, .env.example.
+
+2) Создать .env из примера
+Copy-Item .env.example .env
+notepad .env
+
+3) Настроить LLM (выбери один вариант)
+ YandexGPT (через Yandex Cloud)
+
+В .env вставь:
+
 LLM_PROVIDER=yandex
-YANDEX_API_KEY=YOUR_YANDEX_API_KEY_HERE
-YANDEX_FOLDER_ID=YOUR_FOLDER_ID_HERE
+YANDEX_API_KEY=ТВОЙ_API_KEY_ИЗ_YC
+YANDEX_FOLDER_ID=ТВОЙ_FOLDER_ID
 YANDEX_MODEL=yandexgpt/latest
-⚠️ Never commit .env (contains secrets). Use .env.example only.
 
-2) Run services
-docker compose up --build
-3) Health checks
-Fetcher: http://localhost:8001/health
 
-Analyzer: http://localhost:8002/health
+⚠️ Важно: YANDEX_API_KEY должен быть Api-Key, НЕ t1....
 
-API
-Fetch articles
-Search
-POST http://localhost:8001/fetch
+4) Запустить контейнеры
 
-{
-  "query": "machine learning",
-  "max_results": 2,
-  "fetch_full_text": false
-}
-Fetch by arXiv ID
-POST http://localhost:8001/fetch
+В корне проекта:
 
-{
-  "arxiv_id": "2306.04338",
-  "fetch_full_text": false
-}
-fetch_full_text=true downloads PDF and extracts text (limited).
+docker compose down
+docker compose up --build -d
+docker compose ps
 
-Analyze one article
-POST http://localhost:8002/analyze
 
-{
-  "arxiv_id": "2306.04338",
-  "title": "Title",
-  "abstract": "Abstract text...",
-  "categories": ["stat.ML"]
-}
-Response (example shape):
+Ожидаемо:
 
-{
-  "arxiv_id": "2306.04338",
-  "analysis": {
-    "main_topic": "...",
-    "methodology": "...",
-    "key_findings": ["..."],
-    "techniques": ["..."],
-    "category": {
-      "domain": "Statistics",
-      "subcategory": "Machine Learning",
-      "complexity": "Intermediate",
-      "article_type": "Theory"
-    },
-    "summary": {
-      "brief": "...",
-      "key_points": ["..."]
-    }
-  },
-  "confidence": 0.78,
-  "analysis_timestamp": "2026-01-22T10:30:00Z"
-}
-Batch analyze
-POST http://localhost:8002/batch-analyze
+fetcher-service → Up → порт 8001
 
-{
-  "articles": [
-    { "arxiv_id": "2306.04338", "title": "...", "abstract": "...", "categories": ["stat.ML"] },
-    { "arxiv_id": "2301.12345", "title": "...", "abstract": "...", "categories": ["cs.LG"] }
-  ],
-  "max_concurrent": 3
-}
-PowerShell examples (Windows)
-Fetch -> Analyze pipeline
+analyzer-service → Up → порт 8002
+
+5) Проверка health
+Invoke-RestMethod http://localhost:8001/health
+Invoke-RestMethod http://localhost:8002/health
+
+
+Должно вернуть:
+
+{"status":"ok"}
+
+6) Тест: получить статьи из arXiv (fetcher)
 $fetchBody = @{
   query = "machine learning"
   max_results = 1
@@ -125,6 +75,11 @@ $fetchResp = Invoke-RestMethod -Method Post `
   -ContentType "application/json" `
   -Body $fetchBody
 
+$fetchResp.total
+$fetchResp.articles[0].arxiv_id
+$fetchResp.articles[0].title
+
+7) Тест: анализ статьи LLM (analyzer)
 $article = $fetchResp.articles[0]
 
 $analyzeBody = @{
@@ -139,25 +94,28 @@ $analysis = Invoke-RestMethod -Method Post `
   -ContentType "application/json" `
   -Body $analyzeBody
 
-$analysis | ConvertTo-Json -Depth 20
-Tests
-Unit tests are located in:
+$analysis.analysis.main_topic
+$analysis.analysis.summary.brief
+$analysis.analysis.category
+$analysis.confidence
 
-fetcher-service/tests
 
-analyzer-service/tests
+Если это отработало — всё готово ✅
 
-Run in containers:
+8) Если что-то сломалось — где смотреть
 
-docker compose exec fetcher pytest -q
-docker compose exec analyzer pytest -q
-Notes / Design choices
-Async HTTP calls via httpx
+Логи:
 
-Strict response validation via pydantic
+docker compose logs fetcher --tail=200
+docker compose logs analyzer --tail=200
 
-LLM output is forced to JSON + validated
 
-Text size is capped (LLM_MAX_TEXT_CHARS, default 50000)
+Остановить всё:
 
-Simple in-memory TTL cache avoids re-analyzing the same paper
+docker compose down
+
+9) Где открыть Swagger (удобно)
+
+Fetcher docs: http://localhost:8001/docs
+
+Analyzer docs: http://localhost:8002/docs

@@ -1,0 +1,26 @@
+﻿services:
+  fetcher:
+    build: ./fetcher-service
+    container_name: fetcher-service
+    ports:
+      - "8001:8000"
+    environment:
+      FETCHER_HTTP_TIMEOUT: "25"
+      FETCHER_MAX_PDF_PAGES: "10"
+      FETCHER_MAX_TEXT_CHARS: "50000"
+      FETCHER_USER_AGENT: "arxiv-llm-system/1.0 (contact: you@example.com)"
+
+  analyzer:
+    build: ./analyzer-service
+    container_name: analyzer-service
+    ports:
+      - "8002:8000"
+    env_file:
+      - .env
+    environment:
+      LLM_TIMEOUT: "45"
+      LLM_MAX_TEXT_CHARS: "50000"
+      CACHE_TTL_SECONDS: "3600"
+      CACHE_MAXSIZE: "2048"
+
+

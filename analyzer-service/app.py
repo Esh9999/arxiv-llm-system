@@ -11,6 +11,10 @@ from cachetools import TTLCache
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel, Field
 from pydantic_settings import BaseSettings
+import logging
+
+logger = logging.getLogger("analyzer")
+logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO"))
 
 
 # -----------------------------
@@ -326,6 +330,14 @@ async def analyze_one(article: ArticleIn) -> AnalyzeResponse:
 
     # строгая валидация структуры ответа
     analysis = AnalysisOut.model_validate(obj)
+
+resp = AnalyzeResponse(
+    arxiv_id=article.arxiv_id,
+    analysis=analysis,
+    confidence=float(analysis.confidence),
+    analysis_timestamp=_now_iso(),
+)
+
 
     # уверенность: выше при наличии full_text
     has_full = bool(article.full_text and len(article.full_text.strip()) > 500)

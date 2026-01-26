@@ -1,5 +1,4 @@
-from app import _extract_json_object
-
+from analyzer_service_app import _extract_json_object  # see note below
 
 def test_extract_json_object_plain():
     s = '{"a":1,"b":2}'

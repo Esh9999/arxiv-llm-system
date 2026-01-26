@@ -1,18 +1,22 @@
+import io
+import logging
+import os
 import re
+import xml.etree.ElementTree as ET
 from datetime import datetime
 from typing import List, Optional
 from urllib.parse import quote_plus
-from xml.etree import ElementTree as ET
 
-import fitz  # PyMuPDF
 import httpx
 from fastapi import FastAPI, HTTPException
+from fastapi.responses import Response
 from pydantic import BaseModel, Field, model_validator
 from pydantic_settings import BaseSettings
+from prometheus_client import Counter, Histogram, generate_latest, CONTENT_TYPE_LATEST
+from pypdf import PdfReader
 
 
-ARXIV_API = "https://export.arxiv.org/api/query"
-ATOM_NS = {"atom": "http://www.w3.org/2005/Atom"}
+ARXIV_API = "http://export.arxiv.org/api/query"
 
 
 class Settings(BaseSettings):
@@ -20,7 +24,7 @@ class Settings(BaseSettings):
     fetcher_max_pdf_pages: int = Field(10, alias="FETCHER_MAX_PDF_PAGES")
     fetcher_max_text_chars: int = Field(50000, alias="FETCHER_MAX_TEXT_CHARS")
     fetcher_user_agent: str = Field(
-        "arxiv-llm-system/1.0 (contact: you@example.com)",
+        "arxiv-llm-system/1.0",
         alias="FETCHER_USER_AGENT",
     )
 
@@ -30,7 +34,30 @@ class Settings(BaseSettings):
 
 settings = Settings()
 
+LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
+logging.basicConfig(level=LOG_LEVEL, format="%(asctime)s %(levelname)s %(name)s %(message)s")
+logger = logging.getLogger("fetcher")
 
+app = FastAPI(title="Article Fetcher Service", version="1.1.0")
+
+
+# -----------------------------
+# Prometheus metrics
+# -----------------------------
+REQS = Counter("fetcher_requests_total", "Total requests", ["endpoint", "status"])
+LAT = Histogram("fetcher_request_latency_seconds", "Latency", ["endpoint"])
+ARXIV_ERR = Counter("fetcher_arxiv_errors_total", "arXiv errors", ["status"])
+PDF_ERR = Counter("fetcher_pdf_errors_total", "PDF errors", ["stage"])
+
+
+@app.get("/metrics")
+def metrics():
+    return Response(generate_latest(), media_type=CONTENT_TYPE_LATEST)
+
+
+# -----------------------------
+# Models
+# -----------------------------
 class FetchRequest(BaseModel):
     arxiv_id: Optional[str] = None
     query: Optional[str] = None
@@ -38,11 +65,13 @@ class FetchRequest(BaseModel):
     fetch_full_text: bool = False
 
     @model_validator(mode="after")
-    def validate_input(self):
+    def validate_mode(self):
         if bool(self.arxiv_id) == bool(self.query):
             raise ValueError("Provide exactly one of: arxiv_id OR query")
-        if self.query and not (1 <= self.max_results <= 50):
-            raise ValueError("max_results must be within [1..50]")
+        if self.query and (self.max_results < 1 or self.max_results > 50):
+            raise ValueError("max_results must be between 1 and 50")
+        if self.arxiv_id and not re.fullmatch(r"\d{4}\.\d{4,5}(v\d+)?", self.arxiv_id.strip()):
+            raise ValueError("Invalid arxiv_id format, expected like 2301.12345 or 2301.12345v2")
         return self
 
 
@@ -63,70 +92,70 @@ class FetchResponse(BaseModel):
     total: int
 
 
-app = FastAPI(title="Article Fetcher Service", version="1.0.0")
+# -----------------------------
+# arXiv parsing
+# -----------------------------
+def _strip(s: Optional[str]) -> str:
+    return (s or "").strip().replace("\n", " ")
 
 
-def _clean(s: str) -> str:
-    return re.sub(r"\s+", " ", (s or "").strip())
-
-
-def _extract_arxiv_id(entry_id: str) -> str:
-    """
-    From 'http://arxiv.org/abs/2301.12345v2' -> '2301.12345'
-    """
-    m = re.search(r"(\d{4}\.\d{4,5})(v\d+)?", entry_id or "")
+def _arxiv_id_from_entry_id(entry_id: str) -> str:
+    # entry_id example: http://arxiv.org/abs/2301.12345v1
+    m = re.search(r"/abs/([^/]+)$", entry_id.strip())
     if not m:
-        return (entry_id or "").strip()
+        return entry_id.strip()
     return m.group(1)
-
-
-def _pdf_url_from_entry(entry: ET.Element, arxiv_id: str) -> str:
-    for link in entry.findall("atom:link", ATOM_NS):
-        href = link.attrib.get("href", "")
-        ltype = link.attrib.get("type", "")
-        title = (link.attrib.get("title", "") or "").lower()
-        if ltype == "application/pdf" or title == "pdf" or href.endswith(".pdf"):
-            return href
-    return f"https://arxiv.org/pdf/{arxiv_id}.pdf"
 
 
 def parse_arxiv_atom(xml_text: str) -> List[ArticleOut]:
     try:
         root = ET.fromstring(xml_text)
     except ET.ParseError as e:
-        raise ValueError(f"Failed to parse arXiv XML: {e}")
+        raise ValueError(f"Invalid XML from arXiv: {e}")
 
-    entries = root.findall("atom:entry", ATOM_NS)
+    ns = {"atom": "http://www.w3.org/2005/Atom"}
+
     articles: List[ArticleOut] = []
+    for entry in root.findall("atom:entry", ns):
+        entry_id = _strip(entry.findtext("atom:id", default="", namespaces=ns))
+        arxiv_id = _arxiv_id_from_entry_id(entry_id)
 
-    for entry in entries:
-        entry_id = entry.findtext("atom:id", default="", namespaces=ATOM_NS)
-        arxiv_id = _extract_arxiv_id(entry_id)
-
-        title = _clean(entry.findtext("atom:title", default="", namespaces=ATOM_NS))
-        abstract = _clean(entry.findtext("atom:summary", default="", namespaces=ATOM_NS))
+        title = _strip(entry.findtext("atom:title", default="", namespaces=ns))
+        abstract = _strip(entry.findtext("atom:summary", default="", namespaces=ns))
+        published = _strip(entry.findtext("atom:published", default="", namespaces=ns))
+        if published:
+            # normalize to YYYY-MM-DD
+            try:
+                published_dt = datetime.fromisoformat(published.replace("Z", "+00:00"))
+                published = published_dt.date().isoformat()
+            except Exception:
+                pass
 
         authors = []
-        for a in entry.findall("atom:author", ATOM_NS):
-            name = _clean(a.findtext("atom:name", default="", namespaces=ATOM_NS))
+        for a in entry.findall("atom:author", ns):
+            name = _strip(a.findtext("atom:name", default="", namespaces=ns))
             if name:
                 authors.append(name)
 
         categories = []
-        for c in entry.findall("atom:category", ATOM_NS):
-            term = c.attrib.get("term")
+        for c in entry.findall("atom:category", ns):
+            term = c.attrib.get("term", "").strip()
             if term:
                 categories.append(term)
 
-        published_raw = entry.findtext("atom:published", default="", namespaces=ATOM_NS)
-        published = ""
-        if published_raw:
-            try:
-                published = datetime.fromisoformat(published_raw.replace("Z", "+00:00")).date().isoformat()
-            except Exception:
-                published = published_raw[:10]
+        pdf_url = ""
+        for link in entry.findall("atom:link", ns):
+            href = link.attrib.get("href", "").strip()
+            title_attr = link.attrib.get("title", "").strip().lower()
+            type_attr = link.attrib.get("type", "").strip().lower()
+            if title_attr == "pdf" or type_attr == "application/pdf":
+                pdf_url = href
+                break
 
-        pdf_url = _pdf_url_from_entry(entry, arxiv_id)
+        # fallback: if no pdf link found, build it from arxiv_id (remove version)
+        if not pdf_url and arxiv_id:
+            base_id = re.sub(r"v\d+$", "", arxiv_id)
+            pdf_url = f"https://arxiv.org/pdf/{base_id}.pdf"
 
         articles.append(
             ArticleOut(
@@ -145,61 +174,63 @@ def parse_arxiv_atom(xml_text: str) -> List[ArticleOut]:
     return articles
 
 
-def _normalize_search_query(q: str) -> str:
-    q = (q or "").strip()
-    # If user already provides advanced query like 'cat:cs.LG AND ti:transformer'
-    if ":" in q:
-        return q
-    return f"all:{q}"
-
-
-async def _arxiv_get(client: httpx.AsyncClient, url: str) -> str:
+# -----------------------------
+# Fetching
+# -----------------------------
+async def _get_arxiv_by_id(client: httpx.AsyncClient, arxiv_id: str) -> List[ArticleOut]:
+    url = f"{ARXIV_API}?id_list={quote_plus(arxiv_id)}"
     r = await client.get(url)
     if r.status_code != 200:
-        # arXiv sometimes returns HTML text on blocks; include a short snippet
-        snippet = (r.text or "")[:200].replace("\n", " ")
-        raise HTTPException(status_code=502, detail=f"arXiv API error {r.status_code}: {snippet}")
-    return r.text
+        ARXIV_ERR.labels(str(r.status_code)).inc()
+        raise HTTPException(status_code=502, detail=f"arXiv API error: {r.status_code}")
+    try:
+        return parse_arxiv_atom(r.text)
+    except ValueError as e:
+        raise HTTPException(status_code=502, detail=str(e))
 
 
-async def fetch_by_id(client: httpx.AsyncClient, arxiv_id: str) -> List[ArticleOut]:
-    url = f"{ARXIV_API}?id_list={quote_plus(arxiv_id)}"
-    xml = await _arxiv_get(client, url)
-    return parse_arxiv_atom(xml)
+async def _search_arxiv(client: httpx.AsyncClient, query: str, max_results: int) -> List[ArticleOut]:
+    q = quote_plus(f"all:{query}")
+    url = f"{ARXIV_API}?search_query={q}&start=0&max_results={max_results}"
+    r = await client.get(url)
+    if r.status_code != 200:
+        ARXIV_ERR.labels(str(r.status_code)).inc()
+        raise HTTPException(status_code=502, detail=f"arXiv API error: {r.status_code}")
+    try:
+        return parse_arxiv_atom(r.text)
+    except ValueError as e:
+        raise HTTPException(status_code=502, detail=str(e))
 
 
-async def search(client: httpx.AsyncClient, query: str, max_results: int) -> List[ArticleOut]:
-    sq = quote_plus(_normalize_search_query(query))
-    url = f"{ARXIV_API}?search_query={sq}&max_results={max_results}"
-    xml = await _arxiv_get(client, url)
-    return parse_arxiv_atom(xml)
-
-
-async def extract_pdf_text(client: httpx.AsyncClient, pdf_url: str, max_pages: int) -> str:
+async def _extract_pdf_text(client: httpx.AsyncClient, pdf_url: str, max_pages: int) -> str:
     r = await client.get(pdf_url)
     if r.status_code != 200:
-        raise HTTPException(status_code=502, detail=f"Failed to download PDF ({r.status_code})")
+        PDF_ERR.labels("download").inc()
+        raise HTTPException(status_code=502, detail=f"Failed to download PDF: {r.status_code}")
 
     try:
-        doc = fitz.open(stream=r.content, filetype="pdf")
+        reader = PdfReader(io.BytesIO(r.content))
+        pages = reader.pages[:max_pages]
+        parts = []
+        for p in pages:
+            t = p.extract_text() or ""
+            parts.append(t)
+        text = "\n".join(parts).strip()
+        return text
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"PDF open failed: {e}")
-
-    pages = min(max_pages, doc.page_count)
-    parts: List[str] = []
-
-    for i in range(pages):
-        try:
-            page = doc.load_page(i)
-            t = page.get_text("text")
-            if t:
-                parts.append(t)
-        except Exception:
-            continue
-
-    return "\n".join(parts).strip()
+        PDF_ERR.labels("parse").inc()
+        raise HTTPException(status_code=502, detail=f"PDF parse error: {e}")
 
 
+def _limit_text(s: str) -> str:
+    if len(s) > settings.fetcher_max_text_chars:
+        return s[: settings.fetcher_max_text_chars]
+    return s
+
+
+# -----------------------------
+# Endpoints
+# -----------------------------
 @app.get("/health")
 async def health():
     return {"status": "ok"}
@@ -207,32 +238,48 @@ async def health():
 
 @app.post("/fetch", response_model=FetchResponse)
 async def fetch(req: FetchRequest) -> FetchResponse:
-    headers = {"User-Agent": settings.fetcher_user_agent}
+    with LAT.labels("fetch").time():
+        headers = {"User-Agent": settings.fetcher_user_agent}
+        timeout = httpx.Timeout(settings.fetcher_http_timeout)
 
-    async with httpx.AsyncClient(
-        timeout=httpx.Timeout(settings.fetcher_http_timeout),
-        follow_redirects=True,
-        headers=headers,
-    ) as client:
-        if req.arxiv_id:
-            articles = await fetch_by_id(client, req.arxiv_id)
-        else:
-            articles = await search(client, req.query or "", req.max_results)
+        async with httpx.AsyncClient(headers=headers, timeout=timeout) as client:
+            try:
+                if req.arxiv_id:
+                    articles = await _get_arxiv_by_id(client, req.arxiv_id.strip())
+                else:
+                    articles = await _search_arxiv(client, req.query.strip(), req.max_results)
 
-        if not articles:
-            raise HTTPException(status_code=404, detail="No articles found")
+                if not articles:
+                    REQS.labels("fetch", "200").inc()
+                    return FetchResponse(articles=[], total=0)
 
-        if req.fetch_full_text:
-            for a in articles:
-                full_text = await extract_pdf_text(client, a.pdf_url, settings.fetcher_max_pdf_pages)
-                # Hard limit for analysis
-                if len(full_text) > settings.fetcher_max_text_chars:
-                    full_text = full_text[: settings.fetcher_max_text_chars]
-                a.full_text = full_text
-                a.text_length = len(full_text)
-        else:
-            for a in articles:
-                a.full_text = None
-                a.text_length = len(a.abstract or "")
+                if req.fetch_full_text:
+                    for a in articles:
+                        if a.pdf_url:
+                            full = await _extract_pdf_text(client, a.pdf_url, settings.fetcher_max_pdf_pages)
+                            full = _limit_text(full)
+                            a.full_text = full
+                            a.text_length = len(full)
+                        else:
+                            a.full_text = ""
+                            a.text_length = 0
 
-        return FetchResponse(articles=articles, total=len(articles))
+                else:
+                    for a in articles:
+                        a.text_length = len(a.abstract or "")
+
+                REQS.labels("fetch", "200").inc()
+                logger.info(
+                    "fetch.success",
+                    extra={"mode": "id" if req.arxiv_id else "query", "count": len(articles)},
+                )
+                return FetchResponse(articles=articles, total=len(articles))
+
+            except HTTPException as e:
+                REQS.labels("fetch", str(e.status_code)).inc()
+                logger.error("fetch.http_error", extra={"status": e.status_code, "detail": str(e.detail)})
+                raise
+            except Exception as e:
+                REQS.labels("fetch", "500").inc()
+                logger.exception("fetch.unexpected_error")
+                raise HTTPException(status_code=500, detail=str(e))

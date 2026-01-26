@@ -9,7 +9,11 @@
       FETCHER_MAX_PDF_PAGES: "10"
       FETCHER_MAX_TEXT_CHARS: "50000"
       FETCHER_USER_AGENT: "arxiv-llm-system/1.0 (contact: you@example.com)"
-
+      healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/health').read()"]
+      interval: 10s
+      timeout: 3s
+      retries: 10
   analyzer:
     build: ./analyzer-service
     container_name: analyzer-service
@@ -22,5 +26,12 @@
       LLM_MAX_TEXT_CHARS: "50000"
       CACHE_TTL_SECONDS: "3600"
       CACHE_MAXSIZE: "2048"
-
+    depends_on:
+      fetcher:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/health').read()"]
+      interval: 10s
+      timeout: 3s
+      retries: 10
 

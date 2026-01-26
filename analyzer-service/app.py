@@ -85,6 +85,7 @@ class AnalysisOut(BaseModel):
     techniques: List[str]
     category: CategoryOut
     summary: SummaryOut
+    confidence: float = Field(ge=0.0, le=1.0)
 
 
 class AnalyzeResponse(BaseModel):
@@ -136,15 +137,22 @@ Return ONLY valid JSON that matches this schema exactly:
   "techniques": ["string", "..."],
   "category": {{
     "domain": "Computer Science|Physics|Mathematics|Statistics|Biology|Other",
-    "subcategory": "string (e.g. Machine Learning, NLP, Computer Vision, etc.)",
+    "subcategory": "string",
     "complexity": "Beginner|Intermediate|Advanced",
     "article_type": "Theory|Application|Survey|Tutorial"
   }},
   "summary": {{
     "brief": "2-3 sentences",
     "key_points": ["bullet", "..."]
-  }}
+  }},
+  "confidence": 0.0
 }}
+
+Rules for confidence:
+- 0.9-1.0: very certain, clear methods+results in text
+- 0.7-0.89: reasonably certain, minor ambiguity
+- 0.5-0.69: moderate uncertainty, missing details
+- <0.5: highly uncertain
 
 Paper metadata:
 - arXiv ID: {article.arxiv_id}

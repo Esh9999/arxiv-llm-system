@@ -12,6 +12,18 @@ from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel, Field
 from pydantic_settings import BaseSettings
 import logging
+from prometheus_client import Counter, Histogram, generate_latest, CONTENT_TYPE_LATEST
+from fastapi.responses import Response
+
+REQS = Counter("analyzer_requests_total", "Total requests", ["endpoint", "status"])
+LAT = Histogram("analyzer_request_latency_seconds", "Latency", ["endpoint"])
+LLM_ERR = Counter("analyzer_llm_errors_total", "LLM errors", ["provider", "status"])
+CACHE_HIT = Counter("analyzer_cache_hits_total", "Cache hits")
+CACHE_MISS = Counter("analyzer_cache_misses_total", "Cache misses")
+
+@app.get("/metrics")
+def metrics():
+    return Response(generate_latest(), media_type=CONTENT_TYPE_LATEST)
 
 logger = logging.getLogger("analyzer")
 logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO"))
@@ -322,6 +334,11 @@ async def call_llm(prompt: str) -> Dict[str, Any]:
 async def analyze_one(article: ArticleIn) -> AnalyzeResponse:
     key = _cache_key(article)
     cached = _cache.get(key)
+if cached:
+    CACHE_HIT.inc()
+    return cached
+CACHE_MISS.inc()
+
     if cached:
         return cached
 
@@ -364,7 +381,15 @@ async def health():
 
 @app.post("/analyze", response_model=AnalyzeResponse)
 async def analyze(article: ArticleIn) -> AnalyzeResponse:
-    return await analyze_one(article)
+    with LAT.labels("analyze").time():
+        try:
+            out = await analyze_one(article)
+            REQS.labels("analyze", "200").inc()
+            return out
+        except HTTPException as e:
+            REQS.labels("analyze", str(e.status_code)).inc()
+            raise
+
 
 
 @app.post("/batch-analyze", response_model=List[AnalyzeResponse])

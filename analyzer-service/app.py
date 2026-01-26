@@ -1,6 +1,7 @@
 import asyncio
 import hashlib
 import json
+import logging
 import os
 import re
 from datetime import datetime, timezone
@@ -9,30 +10,23 @@ from typing import Any, Dict, List, Optional
 import httpx
 from cachetools import TTLCache
 from fastapi import FastAPI, HTTPException
+from fastapi.responses import Response
 from pydantic import BaseModel, Field
 from pydantic_settings import BaseSettings
-import logging
 from prometheus_client import Counter, Histogram, generate_latest, CONTENT_TYPE_LATEST
-from fastapi.responses import Response
 
-REQS = Counter("analyzer_requests_total", "Total requests", ["endpoint", "status"])
-LAT = Histogram("analyzer_request_latency_seconds", "Latency", ["endpoint"])
-LLM_ERR = Counter("analyzer_llm_errors_total", "LLM errors", ["provider", "status"])
-CACHE_HIT = Counter("analyzer_cache_hits_total", "Cache hits")
-CACHE_MISS = Counter("analyzer_cache_misses_total", "Cache misses")
 
-@app.get("/metrics")
-def metrics():
-    return Response(generate_latest(), media_type=CONTENT_TYPE_LATEST)
-
+# -----------------------------
+# Logging (structured-ish)
+# -----------------------------
+LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
+logging.basicConfig(level=LOG_LEVEL, format="%(asctime)s %(levelname)s %(name)s %(message)s")
 logger = logging.getLogger("analyzer")
-logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO"))
 
 
 # -----------------------------
 # Settings
 # -----------------------------
-
 class Settings(BaseSettings):
     # provider: "openai" | "yandex"
     llm_provider: str = Field("openai", alias="LLM_PROVIDER")
@@ -65,15 +59,29 @@ class Settings(BaseSettings):
 
 
 settings = Settings()
-app = FastAPI(title="Article Analyzer Service", version="1.0.0")
+app = FastAPI(title="Article Analyzer Service", version="1.1.0")
 
 _cache: TTLCache = TTLCache(maxsize=settings.cache_maxsize, ttl=settings.cache_ttl_seconds)
 
 
 # -----------------------------
+# Prometheus metrics
+# -----------------------------
+REQS = Counter("analyzer_requests_total", "Total requests", ["endpoint", "status"])
+LAT = Histogram("analyzer_request_latency_seconds", "Latency", ["endpoint"])
+LLM_ERR = Counter("analyzer_llm_errors_total", "LLM errors", ["provider", "status"])
+CACHE_HIT = Counter("analyzer_cache_hits_total", "Cache hits")
+CACHE_MISS = Counter("analyzer_cache_misses_total", "Cache misses")
+
+
+@app.get("/metrics")
+def metrics():
+    return Response(generate_latest(), media_type=CONTENT_TYPE_LATEST)
+
+
+# -----------------------------
 # API Models
 # -----------------------------
-
 class ArticleIn(BaseModel):
     arxiv_id: str
     title: str
@@ -101,6 +109,7 @@ class AnalysisOut(BaseModel):
     techniques: List[str]
     category: CategoryOut
     summary: SummaryOut
+    # ✅ Confidence from LLM (self-reported, validated)
     confidence: float = Field(ge=0.0, le=1.0)
 
 
@@ -119,7 +128,6 @@ class BatchAnalyzeRequest(BaseModel):
 # -----------------------------
 # Helpers
 # -----------------------------
-
 def _now_iso() -> str:
     return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
 
@@ -134,6 +142,7 @@ def _clip_text(article: ArticleIn) -> str:
 def _cache_key(article: ArticleIn) -> str:
     text = _clip_text(article)
     h = hashlib.sha1(text.encode("utf-8")).hexdigest()
+    # include provider+model to avoid cross-provider collisions
     return f"{settings.llm_provider}:{settings.llm_model}:{article.arxiv_id}:{h}"
 
 
@@ -153,7 +162,7 @@ Return ONLY valid JSON that matches this schema exactly:
   "techniques": ["string", "..."],
   "category": {{
     "domain": "Computer Science|Physics|Mathematics|Statistics|Biology|Other",
-    "subcategory": "string",
+    "subcategory": "string (e.g. Machine Learning, NLP, Computer Vision, etc.)",
     "complexity": "Beginner|Intermediate|Advanced",
     "article_type": "Theory|Application|Survey|Tutorial"
   }},
@@ -164,18 +173,18 @@ Return ONLY valid JSON that matches this schema exactly:
   "confidence": 0.0
 }}
 
-Rules for confidence:
-- 0.9-1.0: very certain, clear methods+results in text
-- 0.7-0.89: reasonably certain, minor ambiguity
-- 0.5-0.69: moderate uncertainty, missing details
-- <0.5: highly uncertain
+Rules for confidence (0..1):
+- 0.90-1.00: very certain, text clearly supports claims
+- 0.70-0.89: reasonably certain, minor ambiguity
+- 0.50-0.69: moderate uncertainty, missing details
+- <0.50: highly uncertain / speculative
 
 Paper metadata:
 - arXiv ID: {article.arxiv_id}
 - Title: {article.title}
 - Categories: {cats}
 
-Paper text (may be abstract or full text):
+Paper text (abstract or full text):
 {text}
 """.strip()
 
@@ -199,24 +208,19 @@ def _extract_json_object(s: str) -> str:
     raise ValueError("No JSON object found in model response")
 
 
-async def _post_json(client: httpx.AsyncClient, url: str, headers: dict, payload: dict) -> httpx.Response:
-    return await client.post(url, headers=headers, json=payload)
-
-
 async def _call_with_retries(fn, attempts: int = 3) -> Any:
     last_exc: Optional[Exception] = None
     for i in range(attempts):
         try:
             return await fn()
         except HTTPException as e:
-            # не ретраим авторизацию/доступ
+            # Do not retry auth/access issues
             if e.status_code in (401, 403):
                 raise
             last_exc = e
         except (httpx.TimeoutException, httpx.ConnectError, httpx.ReadError) as e:
             last_exc = e
 
-        # backoff
         await asyncio.sleep(min(2 ** i, 6))
 
     if isinstance(last_exc, HTTPException):
@@ -224,10 +228,46 @@ async def _call_with_retries(fn, attempts: int = 3) -> Any:
     raise HTTPException(status_code=502, detail=f"LLM call failed after retries: {last_exc}")
 
 
+def heuristic_fallback(article: ArticleIn, reason: str) -> AnalyzeResponse:
+    # Honest fallback: minimal extraction, low confidence.
+    brief = (article.abstract or "").strip()
+    if len(brief) > 400:
+        brief = brief[:400]
+
+    analysis = AnalysisOut(
+        main_topic=(article.title or "Unknown").strip(),
+        methodology="N/A",
+        key_findings=[],
+        techniques=[],
+        category=CategoryOut(
+            domain="Other",
+            subcategory="Unknown",
+            complexity="Beginner",
+            article_type="Theory",
+        ),
+        summary=SummaryOut(
+            brief=brief or "N/A",
+            key_points=[],
+        ),
+        confidence=0.25,
+    )
+
+    logger.warning(
+        "analyze.fallback",
+        extra={"arxiv_id": article.arxiv_id, "reason": reason, "provider": settings.llm_provider},
+    )
+
+    return AnalyzeResponse(
+        arxiv_id=article.arxiv_id,
+        analysis=analysis,
+        confidence=float(analysis.confidence),
+        analysis_timestamp=_now_iso(),
+    )
+
+
 # -----------------------------
 # LLM Providers
 # -----------------------------
-
 async def call_openai_compatible(prompt: str) -> Dict[str, Any]:
     if not settings.llm_api_key:
         raise HTTPException(status_code=500, detail="LLM_API_KEY is not set")
@@ -251,15 +291,22 @@ async def call_openai_compatible(prompt: str) -> Dict[str, Any]:
         "temperature": 0.2,
     }
 
-    # JSON mode (если провайдер поддерживает)
+    # JSON mode (if supported by provider)
     if settings.llm_json_mode:
         payload["response_format"] = {"type": "json_object"}
 
     async with httpx.AsyncClient(timeout=settings.llm_timeout) as client:
+
         async def _do():
-            r = await _post_json(client, f"{settings.llm_base_url}/chat/completions", headers, payload)
+            r = await client.post(f"{settings.llm_base_url}/chat/completions", headers=headers, json=payload)
             if r.status_code != 200:
+                LLM_ERR.labels(settings.llm_provider, str(r.status_code)).inc()
+                logger.error(
+                    "llm.error",
+                    extra={"provider": settings.llm_provider, "status": r.status_code, "body": r.text[:200]},
+                )
                 raise HTTPException(status_code=502, detail=f"LLM error {r.status_code}: {r.text[:300]}")
+
             data = r.json()
             content = data["choices"][0]["message"]["content"]
             try:
@@ -268,6 +315,8 @@ async def call_openai_compatible(prompt: str) -> Dict[str, Any]:
                     raise ValueError("JSON is not an object")
                 return obj
             except Exception as e:
+                LLM_ERR.labels(settings.llm_provider, "invalid_json").inc()
+                logger.error("llm.invalid_json", extra={"provider": settings.llm_provider, "err": str(e)})
                 raise HTTPException(status_code=502, detail=f"LLM returned invalid JSON: {e}")
 
         return await _call_with_retries(_do, attempts=3)
@@ -291,22 +340,23 @@ async def call_yandex_gpt(prompt: str) -> Dict[str, Any]:
             "maxTokens": 2000,
         },
         "messages": [
-            {
-                "role": "system",
-                "text": "Return ONLY valid JSON. No markdown. No explanation.",
-            },
-            {
-                "role": "user",
-                "text": prompt,
-            },
+            {"role": "system", "text": "Return ONLY valid JSON. No markdown. No explanation."},
+            {"role": "user", "text": prompt},
         ],
     }
 
     async with httpx.AsyncClient(timeout=settings.llm_timeout) as client:
+
         async def _do():
-            r = await _post_json(client, url, headers, payload)
+            r = await client.post(url, headers=headers, json=payload)
             if r.status_code != 200:
+                LLM_ERR.labels(settings.llm_provider, str(r.status_code)).inc()
+                logger.error(
+                    "llm.error",
+                    extra={"provider": settings.llm_provider, "status": r.status_code, "body": r.text[:200]},
+                )
                 raise HTTPException(status_code=502, detail=f"YandexGPT error {r.status_code}: {r.text[:300]}")
+
             data = r.json()
             text = data["result"]["alternatives"][0]["message"]["text"]
             try:
@@ -315,6 +365,8 @@ async def call_yandex_gpt(prompt: str) -> Dict[str, Any]:
                     raise ValueError("JSON is not an object")
                 return obj
             except Exception as e:
+                LLM_ERR.labels(settings.llm_provider, "invalid_json").inc()
+                logger.error("llm.invalid_json", extra={"provider": settings.llm_provider, "err": str(e)})
                 raise HTTPException(status_code=502, detail=f"YandexGPT returned invalid JSON: {e}")
 
         return await _call_with_retries(_do, attempts=3)
@@ -330,50 +382,39 @@ async def call_llm(prompt: str) -> Dict[str, Any]:
 # -----------------------------
 # Core analyze logic
 # -----------------------------
-
 async def analyze_one(article: ArticleIn) -> AnalyzeResponse:
     key = _cache_key(article)
     cached = _cache.get(key)
-if cached:
-    CACHE_HIT.inc()
-    return cached
-CACHE_MISS.inc()
-
     if cached:
+        CACHE_HIT.inc()
         return cached
+    CACHE_MISS.inc()
+
+    logger.info("analyze.request", extra={"arxiv_id": article.arxiv_id, "provider": settings.llm_provider})
 
     prompt = build_prompt(article)
-    obj = await call_llm(prompt)
-
-    # строгая валидация структуры ответа
-    analysis = AnalysisOut.model_validate(obj)
-
-resp = AnalyzeResponse(
-    arxiv_id=article.arxiv_id,
-    analysis=analysis,
-    confidence=float(analysis.confidence),
-    analysis_timestamp=_now_iso(),
-)
-
-
-    # уверенность: выше при наличии full_text
-    has_full = bool(article.full_text and len(article.full_text.strip()) > 500)
-    confidence = 0.88 if has_full else 0.78
-
-    resp = AnalyzeResponse(
-        arxiv_id=article.arxiv_id,
-        analysis=analysis,
-        confidence=confidence,
-        analysis_timestamp=_now_iso(),
-    )
-    _cache[key] = resp
-    return resp
+    try:
+        obj = await call_llm(prompt)
+        analysis = AnalysisOut.model_validate(obj)  # strict validation
+        resp = AnalyzeResponse(
+            arxiv_id=article.arxiv_id,
+            analysis=analysis,
+            confidence=float(analysis.confidence),
+            analysis_timestamp=_now_iso(),
+        )
+        _cache[key] = resp
+        logger.info("analyze.success", extra={"arxiv_id": article.arxiv_id})
+        return resp
+    except HTTPException as e:
+        # fallback for non-auth errors or temporary issues
+        return heuristic_fallback(article, reason=f"HTTPException {e.status_code}: {e.detail}")
+    except Exception as e:
+        return heuristic_fallback(article, reason=f"Unexpected error: {e}")
 
 
 # -----------------------------
 # Endpoints
 # -----------------------------
-
 @app.get("/health")
 async def health():
     return {"status": "ok"}
@@ -391,15 +432,17 @@ async def analyze(article: ArticleIn) -> AnalyzeResponse:
             raise
 
 
-
 @app.post("/batch-analyze", response_model=List[AnalyzeResponse])
 async def batch_analyze(req: BatchAnalyzeRequest) -> List[AnalyzeResponse]:
-    max_conc = max(1, min(req.max_concurrent, 20))
-    sem = asyncio.Semaphore(max_conc)
+    with LAT.labels("batch_analyze").time():
+        max_conc = max(1, min(req.max_concurrent, 20))
+        sem = asyncio.Semaphore(max_conc)
 
-    async def worker(a: ArticleIn) -> AnalyzeResponse:
-        async with sem:
-            return await analyze_one(a)
+        async def worker(a: ArticleIn) -> AnalyzeResponse:
+            async with sem:
+                return await analyze_one(a)
 
-    tasks = [asyncio.create_task(worker(a)) for a in req.articles]
-    return await asyncio.gather(*tasks)
+        tasks = [asyncio.create_task(worker(a)) for a in req.articles]
+        results = await asyncio.gather(*tasks)
+        REQS.labels("batch_analyze", "200").inc()
+        return results
